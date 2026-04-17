@@ -1,0 +1,14 @@
+# macOS noise
+.DS_Store
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Tool caches
+.cache/
+
+# JVM / Maven build outputs
+target/

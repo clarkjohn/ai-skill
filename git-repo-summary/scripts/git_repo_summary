@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+from collections import Counter
+from pathlib import Path
+
+
+BUG_PATTERN = r"fix|bug|broken"
+FIREFIGHT_PATTERN = re.compile(r"\b(revert|hotfix|emergency|rollback)\b", re.I)
+TEST_HINTS = ("test", "spec")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Summarize a git repo by churn, bug hotspots, ownership, velocity, and firefighting.")
+    parser.add_argument("repo", nargs="?", default=".", help="target repo")
+    parser.add_argument("--window", default="1 year ago", help="lookback window for churn and recent bugs")
+    parser.add_argument("--recent-window", default="6 months ago", help="window for recent contributor activity")
+    parser.add_argument("--limit", type=int, default=20, help="files to keep in churn and bug rankings")
+    parser.add_argument("--top-files", type=int, default=5, help="top churn files to expand")
+    parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    repo = Path(args.repo).resolve()
+    ensure_git_repo(repo)
+
+    churn = count_files(repo, ["log", "--format=format:", "--name-only", f"--since={args.window}"])
+    bug_all = count_files(repo, ["log", "-i", "-E", f"--grep={BUG_PATTERN}", "--name-only", "--format="])
+    bug_recent = count_files(
+        repo,
+        ["log", "-i", "-E", f"--grep={BUG_PATTERN}", f"--since={args.window}", "--name-only", "--format="],
+    )
+    overall_authors = shortlog(repo, [])
+    recent_authors = shortlog(repo, [f"--since={args.recent_window}"])
+    monthly = month_counts(repo)
+    firefighting = firefight_commits(repo, args.window)
+
+    top_churn = rank_counter(churn, args.limit)
+    top_bug_all = rank_counter(bug_all, args.limit)
+    top_bug_recent = rank_counter(bug_recent, args.limit)
+    top_files = [item["file"] for item in top_churn[: args.top_files]]
+    owners = {file_path: file_owners(repo, file_path, args.window) for file_path in top_files}
+    test_pairs = {file_path: paired_tests(repo, file_path, args.window) for file_path in top_files}
+
+    payload = build_payload(
+        repo=repo,
+        window=args.window,
+        recent_window=args.recent_window,
+        top_churn=top_churn,
+        top_bug_all=top_bug_all,
+        top_bug_recent=top_bug_recent,
+        overall_authors=overall_authors,
+        recent_authors=recent_authors,
+        monthly=monthly,
+        firefighting=firefighting,
+        owners=owners,
+        test_pairs=test_pairs,
+    )
+
+    if args.format == "json":
+        print(json.dumps(payload, indent=2))
+    else:
+        print(render_markdown(payload))
+    return 0
+
+
+def ensure_git_repo(repo: Path) -> None:
+    result = git(repo, ["rev-parse", "--is-inside-work-tree"], check=False)
+    if result.returncode != 0 or result.stdout.strip() != "true":
+        raise SystemExit(f"Not a git repo: {repo}")
+
+
+def git(repo: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True, check=check)
+
+
+def count_files(repo: Path, args: list[str]) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    for line in git(repo, args).stdout.splitlines():
+        path = line.strip()
+        if path:
+            counter[path] += 1
+    return counter
+
+
+def shortlog(repo: Path, extra_args: list[str]) -> list[dict]:
+    counts = Counter(line.strip() for line in git(repo, ["log", "--format=%an", "--no-merges", *extra_args]).stdout.splitlines() if line.strip())
+    return [{"author": author, "commits": commits} for author, commits in counts.most_common()]
+
+
+def month_counts(repo: Path) -> list[dict]:
+    counts = Counter(line.strip() for line in git(repo, ["log", "--format=%ad", "--date=format:%Y-%m"]).stdout.splitlines() if line.strip())
+    return [{"month": month, "commits": counts[month]} for month in sorted(counts)]
+
+
+def firefight_commits(repo: Path, window: str) -> list[str]:
+    return [line.strip() for line in git(repo, ["log", "--oneline", f"--since={window}"]).stdout.splitlines() if FIREFIGHT_PATTERN.search(line)]
+
+
+def file_owners(repo: Path, file_path: str, window: str) -> list[dict]:
+    counts = Counter(line.strip() for line in git(repo, ["log", f"--since={window}", "--format=%an", "--", file_path]).stdout.splitlines() if line.strip())
+    return [{"author": author, "touches": touches} for author, touches in counts.most_common(5)]
+
+
+def paired_tests(repo: Path, file_path: str, window: str) -> dict:
+    stem = Path(file_path).stem.lower()
+    if not stem:
+        return {"status": "none", "candidates": []}
+
+    candidates = []
+    for path in repo.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in {".git", "node_modules", "build", "target"} for part in path.parts):
+            continue
+        lower = path.name.lower()
+        if stem not in lower or not any(hint in lower for hint in TEST_HINTS):
+            continue
+        rel = str(path.relative_to(repo))
+        touches = [line for line in git(repo, ["log", f"--since={window}", "--format=%H", "--", rel]).stdout.splitlines() if line.strip()]
+        candidates.append({"file": rel, "touches": len(touches)})
+
+    candidates.sort(key=lambda item: (-item["touches"], item["file"]))
+    if not candidates:
+        return {"status": "none", "candidates": []}
+    changed = any(item["touches"] > 0 for item in candidates)
+    return {"status": "changed" if changed else "found_not_changed", "candidates": candidates[:3]}
+
+
+def rank_counter(counter: Counter[str], limit: int) -> list[dict]:
+    return [{"rank": idx, "file": file_path, "count": count} for idx, (file_path, count) in enumerate(counter.most_common(limit), start=1)]
+
+
+def build_payload(
+    *,
+    repo: Path,
+    window: str,
+    recent_window: str,
+    top_churn: list[dict],
+    top_bug_all: list[dict],
+    top_bug_recent: list[dict],
+    overall_authors: list[dict],
+    recent_authors: list[dict],
+    monthly: list[dict],
+    firefighting: list[str],
+    owners: dict[str, list[dict]],
+    test_pairs: dict[str, dict],
+) -> dict:
+    bug_rank = {item["file"]: item["rank"] for item in top_bug_all}
+    recent_bug_rank = {item["file"]: item["rank"] for item in top_bug_recent}
+    risk_files = []
+    for item in top_churn[:5]:
+        file_path = item["file"]
+        owner_rows = owners.get(file_path, [])
+        risk_files.append(
+            {
+                "file": file_path,
+                "churn_rank": item["rank"],
+                "churn_count": item["count"],
+                "bug_rank": bug_rank.get(file_path),
+                "recent_bug_rank": recent_bug_rank.get(file_path),
+                "top_owner": owner_rows[0] if owner_rows else None,
+                "ownership_shape": ownership_shape(owner_rows),
+                "test_pairing": test_pairs.get(file_path, {"status": "none", "candidates": []}),
+                "why": why_it_matters(file_path, bug_rank, recent_bug_rank, owner_rows, test_pairs.get(file_path, {})),
+            }
+        )
+
+    overall_total = sum(item["commits"] for item in overall_authors)
+    top_contributor = overall_authors[0] if overall_authors else None
+    top_contributor_share = round((top_contributor["commits"] / overall_total) * 100, 1) if top_contributor and overall_total else 0.0
+    historical_top_missing = bool(top_contributor and top_contributor["author"] not in {item["author"] for item in recent_authors})
+    trend = velocity_trend(monthly)
+
+    return {
+        "repo": str(repo),
+        "window": window,
+        "recent_window": recent_window,
+        "risk_files": risk_files,
+        "overall_authors": overall_authors[:10],
+        "recent_authors": recent_authors[:10],
+        "top_contributor_share": top_contributor_share,
+        "historical_top_missing_recently": historical_top_missing,
+        "monthly": monthly,
+        "velocity_trend": trend,
+        "firefighting": firefighting,
+        "summary": summary_lines(risk_files, top_contributor_share, historical_top_missing, trend, firefighting),
+        "read_next": [{"target": item["file"], "why": item["why"]} for item in risk_files[:3]],
+    }
+
+
+def ownership_shape(owner_rows: list[dict]) -> str:
+    if not owner_rows:
+        return "unknown"
+    total = sum(item["touches"] for item in owner_rows)
+    leader_share = owner_rows[0]["touches"] / total if total else 0
+    if leader_share >= 0.6:
+        return "concentrated"
+    if len(owner_rows) >= 3 and leader_share <= 0.4:
+        return "diffuse"
+    return "mixed"
+
+
+def why_it_matters(file_path: str, bug_rank: dict[str, int], recent_bug_rank: dict[str, int], owner_rows: list[dict], test_pair: dict) -> str:
+    reasons = []
+    if file_path in recent_bug_rank:
+        reasons.append(f"recent bug hotspot #{recent_bug_rank[file_path]}")
+    elif file_path in bug_rank:
+        reasons.append(f"historical bug hotspot #{bug_rank[file_path]}")
+    shape = ownership_shape(owner_rows)
+    if shape == "concentrated":
+        reasons.append("key-person ownership")
+    elif shape == "diffuse":
+        reasons.append("diffuse ownership")
+    if test_pair.get("status") == "none":
+        reasons.append("no obvious paired test")
+    elif test_pair.get("status") == "found_not_changed":
+        reasons.append("paired tests not changing")
+    return ", ".join(reasons) or "high churn leader"
+
+
+def velocity_trend(monthly: list[dict]) -> str:
+    if len(monthly) < 6:
+        return "history too sparse"
+    recent = monthly[-6:]
+    older = monthly[-12:-6] if len(monthly) >= 12 else monthly[:-6]
+    recent_avg = sum(item["commits"] for item in recent) / len(recent)
+    older_avg = sum(item["commits"] for item in older) / len(older) if older else recent_avg
+    if older_avg == 0:
+        return "steady"
+    ratio = recent_avg / older_avg
+    if ratio <= 0.7:
+        return "declining"
+    if ratio >= 1.3:
+        return "accelerating"
+    return "steady"
+
+
+def summary_lines(risk_files: list[dict], top_contributor_share: float, historical_top_missing: bool, trend: str, firefighting: list[str]) -> list[str]:
+    lines = []
+    if risk_files:
+        lines.append(f"top risk file: `{risk_files[0]['file']}`; {risk_files[0]['why']}")
+        overlap = [item for item in risk_files if item["recent_bug_rank"] or item["bug_rank"]]
+        lines.append(f"bug overlap in top churn files: {len(overlap)}/{len(risk_files)}")
+    if top_contributor_share:
+        lines.append(f"top contributor share: {top_contributor_share}%")
+    if historical_top_missing:
+        lines.append("historical top contributor missing from recent activity")
+    lines.append(f"velocity trend: {trend}")
+    lines.append(f"firefighting commits in window: {len(firefighting)}")
+    return lines[:5]
+
+
+def render_markdown(payload: dict) -> str:
+    lines = [
+        "# Git Repo Summary",
+        "",
+        f"- Repo: `{payload['repo']}`",
+        f"- Window: `{payload['window']}`",
+        f"- Recent activity window: `{payload['recent_window']}`",
+        "",
+        "## Summary",
+    ]
+    lines.extend(f"- {line}" for line in payload["summary"])
+    lines.extend(["", "## Top Risk Files", "| file | churn | bug | recent bug | owner | test pairing | why |", "| --- | --- | --- | --- | --- | --- | --- |"])
+    for item in payload["risk_files"]:
+        owner = item["top_owner"]["author"] if item["top_owner"] else "n/a"
+        lines.append(
+            f"| `{item['file']}` | #{item['churn_rank']} ({item['churn_count']}) | {fmt_rank(item['bug_rank'])} | {fmt_rank(item['recent_bug_rank'])} | {owner} ({item['ownership_shape']}) | {format_test_pairing(item['test_pairing'])} | {item['why']} |"
+        )
+
+    lines.extend(["", "## Team Signals"])
+    lines.extend(f"- overall: {item['author']} ({item['commits']})" for item in payload["overall_authors"][:5])
+    lines.extend(f"- recent: {item['author']} ({item['commits']})" for item in payload["recent_authors"][:5])
+    lines.append(f"- top contributor share: {payload['top_contributor_share']}%")
+    if payload["historical_top_missing_recently"]:
+        lines.append("- historical top contributor absent from recent window")
+
+    lines.extend(["", "## Velocity", f"- trend: {payload['velocity_trend']}"])
+    lines.extend(f"- {item['month']}: {item['commits']}" for item in payload["monthly"][-12:])
+
+    lines.extend(["", "## Firefighting"])
+    if payload["firefighting"]:
+        lines.append(f"- count: {len(payload['firefighting'])}")
+        lines.extend(f"- `{line}`" for line in payload["firefighting"][:5])
+    else:
+        lines.append("- count: 0")
+
+    lines.extend(["", "## Read Next"])
+    lines.extend(f"- `{item['target']}`: {item['why']}" for item in payload["read_next"])
+    return "\n".join(lines)
+
+
+def fmt_rank(value: int | None) -> str:
+    return f"#{value}" if value else "-"
+
+
+def format_test_pairing(pairing: dict) -> str:
+    status = pairing.get("status", "none")
+    candidates = pairing.get("candidates", [])
+    if status == "none":
+        return "none"
+    head = candidates[0]["file"] if candidates else "candidate"
+    return f"changed: {head}" if status == "changed" else f"not changing: {head}"
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        os._exit(1)

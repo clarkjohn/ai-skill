@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 
@@ -56,17 +57,21 @@ FRAMEWORK_PREFIXES = (
     "servlet.",
     "tomcat.",
 )
+PROD_PROFILE_NAMES = ("prod", "production", "prd", "live")
+SOURCE_PROFILE_NAMES = ("qa", "uat", "stage", "staging", "preprod", "pre-prod", "ppe", "perf")
+LOW_SIGNAL_PROFILES = {"dev", "local", "test", "tests", "default", "ci", "demo", "sample", "sandbox"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit Spring env config via spring-config-dump")
     parser.add_argument("repo", nargs="?", default=".", help="target repo")
-    parser.add_argument("--from", dest="from_profile", default="qa")
-    parser.add_argument("--to", dest="to_profile", default="prod")
+    parser.add_argument("--from", dest="from_profile", help="source profile to compare from; use `base` for no profile")
+    parser.add_argument("--to", dest="to_profile", help="target profile to compare to; auto-detects prod-like profile by default")
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    default_resolver_dir = Path(__file__).resolve().parent.parent / "tools" / "spring-config-dump"
     parser.add_argument(
         "--resolver-dir",
-        default="/Users/john/ws/projects/skills/spring-prod-config-audit/tools/spring-config-dump",
+        default=str(default_resolver_dir),
         help="directory containing spring-config-dump run.sh / target jar",
     )
     return parser.parse_args()
@@ -76,21 +81,28 @@ def main() -> int:
     args = parse_args()
     repo = Path(args.repo).resolve()
     resolver_dir = Path(args.resolver_dir).resolve()
+    config_files = sorted(find_config_files(repo))
+    detected_profiles = detect_profiles(repo, config_files)
+    selection = select_compare_profiles(detected_profiles, args.from_profile, args.to_profile)
 
     base_raw = run_resolver(resolver_dir, repo, None)
-    from_raw = run_resolver(resolver_dir, repo, args.from_profile)
-    to_raw = run_resolver(resolver_dir, repo, args.to_profile)
+    to_raw = run_resolver(resolver_dir, repo, selection["to_profile"])
     base = snapshot_to_internal(base_raw, None)
-    from_cfg = snapshot_to_internal(from_raw, args.from_profile)
-    to_cfg = snapshot_to_internal(to_raw, args.to_profile)
+    if selection["from_profile"] is None:
+        from_cfg = base
+    else:
+        from_raw = run_resolver(resolver_dir, repo, selection["from_profile"])
+        from_cfg = snapshot_to_internal(from_raw, selection["from_profile"])
+    to_cfg = snapshot_to_internal(to_raw, selection["to_profile"])
     code_usage = analyze_code_usage(repo, to_cfg)
     analysis = compare_configs(base, from_cfg, to_cfg)
 
     payload = {
         "repo": str(repo),
         "spring_boot_version": to_raw.get("bootVersion") or base_raw.get("bootVersion"),
-        "compared": {"from": args.from_profile, "to": args.to_profile},
-        "config_files": sorted(find_config_files(repo)),
+        "compared": {"from": selection["from_label"], "to": selection["to_profile"]},
+        "profile_selection": selection,
+        "config_files": config_files,
         "base": base,
         "from": from_cfg,
         "to": to_cfg,
@@ -123,6 +135,104 @@ def run_resolver(resolver_dir: Path, repo: Path, profile: str | None) -> dict:
     if result.returncode != 0:
         raise SystemExit(result.stderr.strip() or result.stdout.strip() or f"resolver failed: {' '.join(command)}")
     return json.loads(result.stdout)
+
+
+def detect_profiles(repo: Path, config_files: list[str]) -> list[str]:
+    detected = set()
+    for rel_path in config_files:
+        path = repo / rel_path
+        for token in profiles_from_filename(path.name):
+            detected.add(token)
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for token in profiles_from_text(text):
+            detected.add(token)
+    return sorted(detected)
+
+
+def profiles_from_filename(name: str) -> list[str]:
+    match = re.match(r"^(?:application|bootstrap)-([^.]+)\.(?:properties|ya?ml)$", name)
+    if not match:
+        return []
+    return [normalize_profile_token(token) for token in match.group(1).split(",") if normalize_profile_token(token)]
+
+
+def profiles_from_text(text: str) -> list[str]:
+    detected = set()
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        for pattern in (
+            r"spring\.config\.activate\.on-profile\s*[:=]\s*(.+)$",
+            r"spring\.profiles(?:\.(?:active|include|default|group\.[^.:\s=]+))?\s*[:=]\s*(.+)$",
+        ):
+            match = re.search(pattern, stripped)
+            if not match:
+                continue
+            for token in tokenize_profile_values(match.group(1)):
+                detected.add(token)
+    return sorted(detected)
+
+
+def tokenize_profile_values(raw: str) -> list[str]:
+    cleaned = raw.strip().strip("[]")
+    tokens = []
+    for part in re.split(r"[\s,]+", cleaned):
+        token = normalize_profile_token(part)
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def normalize_profile_token(token: str) -> str | None:
+    cleaned = token.strip().strip("'\"")
+    if not cleaned or cleaned.startswith("${") or cleaned in {"!", "&", "|"}:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", cleaned):
+        return None
+    return cleaned.lower()
+
+
+def select_compare_profiles(detected_profiles: list[str], from_arg: str | None, to_arg: str | None) -> dict:
+    to_profile = normalize_cli_profile(to_arg)
+    to_mode = "explicit" if to_profile else "auto"
+    if not to_profile:
+        to_profile = choose_profile(detected_profiles, PROD_PROFILE_NAMES)
+        if not to_profile:
+            detail = ", ".join(detected_profiles) if detected_profiles else "none"
+            raise SystemExit(f"Could not auto-detect a prod profile. Detected profiles: {detail}. Pass --to explicitly.")
+
+    from_profile = normalize_cli_profile(from_arg)
+    from_mode = "explicit" if from_arg is not None else "auto"
+    if from_profile == "base":
+        from_profile = None
+    if from_arg is None:
+        from_profile = choose_profile([p for p in detected_profiles if p != to_profile], SOURCE_PROFILE_NAMES)
+        if from_profile is None:
+            from_profile = None
+    return {
+        "detected_profiles": detected_profiles,
+        "from_profile": from_profile,
+        "from_label": from_profile or "base",
+        "to_profile": to_profile,
+        "from_mode": from_mode,
+        "to_mode": to_mode,
+    }
+
+
+def normalize_cli_profile(profile: str | None) -> str | None:
+    if profile is None:
+        return None
+    value = profile.strip().lower()
+    return value or None
+
+
+def choose_profile(candidates: list[str], preferred: tuple[str, ...]) -> str | None:
+    candidate_set = {candidate for candidate in candidates if candidate}
+    for name in preferred:
+        if name in candidate_set:
+            return name
+    return None
 
 
 def snapshot_to_internal(snapshot: dict, profile: str | None) -> dict:
@@ -425,6 +535,21 @@ def render_markdown(payload: dict) -> str:
     code_usage = payload["code_usage"]
     from_label = payload["compared"]["from"]
     to_label = payload["compared"]["to"]
+    coverage_counts = Counter(item["status"] for item in code_usage["prod_property_coverage"])
+    top_unmapped = [
+        item
+        for item in sorted(
+            code_usage["prod_properties_without_code"],
+            key=lambda item: (severity_rank(item["severity"]), item["key"]),
+        )
+        if item["severity"] in {"high", "medium"}
+    ][:20]
+
+    override_note = (
+        f"- Override gaps mean `{from_label}` diverged from base while `{to_label}` stayed on the base value."
+        if from_label != "base"
+        else f"- With source `base`, override gaps highlight values `{to_label}` left on the base value."
+    )
 
     lines = [
         "# Spring Env Audit",
@@ -432,6 +557,8 @@ def render_markdown(payload: dict) -> str:
         f"- Repo: `{payload['repo']}`",
         f"- Spring Boot: `{payload['spring_boot_version'] or 'unknown'}`",
         f"- Compared: `{from_label}` -> `{to_label}`",
+        f"- Selection: from `{payload['profile_selection']['from_mode']}`, to `{payload['profile_selection']['to_mode']}`",
+        f"- Detected profiles: {', '.join(payload['profile_selection']['detected_profiles']) or 'none'}",
         f"- Config files: {len(payload['config_files'])}",
         f"- Base docs applied: {len(payload['base']['applied_docs'])}",
         "",
@@ -466,17 +593,21 @@ def render_markdown(payload: dict) -> str:
             f"## Code references missing in prod ({len(code_usage['exact_missing_in_prod']) + len(code_usage['prefix_missing_in_prod'])})",
             *render_code_missing(code_usage),
             "",
-            f"## Prod property code coverage ({len(code_usage['prod_property_coverage'])})",
-            *render_prod_property_coverage(code_usage["prod_property_coverage"]),
+            "## Prod property coverage summary",
+            f"- application_exact: {coverage_counts.get('application_exact', 0)}",
+            f"- application_prefix: {coverage_counts.get('application_prefix', 0)}",
+            f"- framework_managed: {coverage_counts.get('framework_managed', 0)}",
+            f"- not_found: {coverage_counts.get('not_found', 0)}",
             "",
-            f"## Prod properties likely unused by application code ({len(code_usage['prod_properties_without_code'])})",
-            *render_unused_prod_properties(code_usage["prod_properties_without_code"]),
+            f"## Highest-signal prod properties likely unused by application code ({len(top_unmapped)})",
+            *render_unused_prod_properties(top_unmapped),
             "",
             "## Notes",
             "- Diff is based on effective Spring Boot config resolution from `spring-config-dump`.",
-            f"- Override gaps mean `{from_label}` diverged from base while `{to_label}` stayed on the base value.",
+            override_note,
             "- Code-usage scan is heuristic: it checks `@Value`, `Environment#getProperty`, binder calls, and `@ConfigurationProperties` prefixes.",
             "- Review manifests and secrets managers before treating missing prod keys as confirmed issues.",
+            "- Use `--format json` when you need the full property-by-property coverage matrix.",
         ]
     )
     return "\n".join(lines)
@@ -510,7 +641,8 @@ def render_override_chains(items: list[dict], from_label: str, to_label: str) ->
     for item in items[:20]:
         lines.append(f"- [{item['severity']}] `{item['key']}`")
         lines.append(f"  base: {format_chain(item['base'])}")
-        lines.append(f"  {from_label}: {format_chain(item['from'])}")
+        if from_label != "base":
+            lines.append(f"  {from_label}: {format_chain(item['from'])}")
         lines.append(f"  {to_label}: {format_chain(item['to'])}")
     return lines
 
@@ -522,11 +654,11 @@ def render_prod_override_gaps(items: list[dict], from_label: str, to_label: str)
     for item in items:
         if item["gap_type"] == "qa_only":
             lines.append(
-                f"- [{item['severity']}] `{item['key']}` {item['summary']}: `{from_label}` has `{item['from_value']}` from `{item['source']}`"
+                f"- [{item['severity']}] `{item['key']}` set in `{from_label}` but missing in `{to_label}`: `{from_label}` has `{item['from_value']}` from `{item['source']}`"
             )
         else:
             lines.append(
-                f"- [{item['severity']}] `{item['key']}` {item['summary']}: base `{item['base_value']}`, `{from_label}` `{item['from_value']}` from `{item['from_source']}`, `{to_label}` stays on base"
+                f"- [{item['severity']}] `{item['key']}` `{from_label}` overrides base but `{to_label}` falls back to base: base `{item['base_value']}`, `{from_label}` `{item['from_value']}` from `{item['from_source']}`, `{to_label}` stays on base"
             )
     return lines
 
@@ -544,20 +676,6 @@ def render_unused_prod_properties(items: list[dict]) -> list[str]:
     if not items:
         return ["- none"]
     return [f"- [{item['severity']}] `{item['key']}` from `{item['source']}` = `{item['value']}`" for item in items[:50]]
-
-
-def render_prod_property_coverage(items: list[dict]) -> list[str]:
-    if not items:
-        return ["- none"]
-    lines = []
-    for item in items:
-        refs = [f"`{ref['file']}:{ref['line']}` exact" for ref in item["exact_matches"]]
-        refs.extend(f"`{ref['file']}:{ref['line']}` prefix `{ref['key']}`" for ref in item["prefix_matches"])
-        ref_text = f" => {', '.join(dict.fromkeys(refs))}" if refs else ""
-        lines.append(
-            f"- [{item['status']}] `{item['key']}` from `{item['source']}` = `{item['value']}`{ref_text}"
-        )
-    return lines
 
 
 def format_chain(chain: list[dict]) -> str:

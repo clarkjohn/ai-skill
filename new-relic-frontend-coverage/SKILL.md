@@ -1,174 +1,90 @@
 ---
 name: new-relic-frontend-coverage
-description: Audit New Relic browser-based synthetic monitors plus browser/session-replay data to estimate frontend coverage percentage, identify uncovered routes and flows, and review monitor evidence such as results, screenshots, and logs.
+description: Audit New Relic browser-based synthetic monitors to estimate frontend coverage percentage, identify uncovered or weak routes, and review monitor evidence. Supports SPA and non-SPA frontends, with feature flags excluded from coverage when disabled.
 ---
 
 # New Relic Frontend Coverage
 
-Purpose: use New Relic Synthetics plus Browser monitoring to answer:
-- what frontend pages or flows are covered by browser-based synthetic monitors
-- what percentage of the intended frontend surface is covered
-- which uncovered routes, browsers, or device classes still need monitors
+Purpose: answer three things fast:
+- which frontend routes or flows are covered by browser-based synthetic monitors
+- what coverage % is reasonable for the target environment
+- which routes are weak, uncovered, or out of scope because of feature flags
 
-## Feature toggles
+## Rules
 
-Keep feature flags in scope from the start.
+- Use browser-based synthetic monitors only: simple browser, scripted browser, or step monitors.
+- Do not treat feature-flagged routes as gaps when the flag is disabled in the target environment.
+- Do not assume `synthetic replay` exists as full monitor-run playback.
+- Use Session Replay only as optional real-user evidence, not as the primary coverage source.
 
-Rules:
-- A route or flow behind a feature toggle is not automatically a coverage gap.
-- Only count toggle-gated routes in the denominator when:
-  - the flag is enabled in the target environment, or
-  - the user explicitly wants pre-launch or dormant-flag coverage.
-- If a route is hidden by a disabled flag in production, classify it as `out of scope by flag`, not `uncovered`.
-- If a route is only enabled for a cohort, region, tenant, or role, mark coverage as conditional and say which audience the monitor covers.
-- If monitors do not set the required flag state, identity, cookie, or query param to expose the feature, call that out as a monitor-scope limitation, not necessarily a missing monitor.
+## Coverage mode
 
-## Important distinction
+Pick one first:
 
-If the user says `synthetic replay`, do not assume New Relic Synthetics has full session replay for monitor runs.
+- `SPA mode`
+  - Use `BrowserInteraction` as primary evidence.
+  - Best when the app uses the SPA-capable browser agent and route changes matter.
+- `MPA/basic mode`
+  - Use Browser page-view/grouped-URL evidence plus Synthetics screenshots/logs/results.
+  - Use this when `BrowserInteraction` is sparse, missing, or the app is not really SPA-instrumented.
 
-Use this split:
-- `Synthetics evidence`: monitor results, step details, screenshots, and script logs
-- `Browser replay`: Session Replay from Browser monitoring for real-user sessions
+If unclear, say which mode you chose and why.
 
-This distinction is an inference from current New Relic docs:
-- Synthetics docs describe results, screenshots, and script logs for browser monitors.
-- Session Replay is a Browser monitoring feature, not a Synthetics monitor-run playback feature.
+## Inputs
 
-## Use this skill when
-
-- The user wants to review New Relic synthetic monitor runs for a frontend.
-- The user wants a coverage percentage for routes, pages, or critical flows.
-- The user wants to know which pages are observed by synthetics versus missing.
-- The user wants to combine synthetic evidence with Browser Session Replay or BrowserInteraction data.
-
-## Required inputs
-
-Collect or infer these first:
-- New Relic account or sub-account
+Collect or infer:
+- New Relic account
 - browser app name
-- monitor IDs or monitor names, if known
+- target environment
 - coverage window: default `7 days`
-- coverage denominator:
-  - preferred: explicit route/page inventory
-  - fallback: router files, sitemap, nav structure, or agreed critical-flow list
+- monitor names or IDs, if known
+- denominator source:
+  - `authoritative`: route inventory from router, sitemap, product list, or explicit flow list
+  - `estimated`: observed nav/routes with best-effort inference
 
-If no denominator exists, say coverage % will only be an observed-coverage estimate, not a full frontend coverage number.
+If the denominator is not authoritative, still compute coverage if useful, but label it `estimated`.
 
-## Core workflow
+## Workflow
 
-1. Inventory the monitors
-- Focus on browser-based monitors:
-  - simple browser
-  - scripted browser
-  - step monitors
-- Ignore ping and API monitors for frontend route coverage unless the user explicitly wants API coverage too.
-- Record:
-  - monitor type
-  - runtime currency
-  - browser types
-  - device emulation settings
-  - locations
-  - frequency
+1. Inventory monitors
+- Keep only browser-based monitors relevant to the frontend.
+- Record: monitor, type, browser/device, location, frequency.
 
-2. Validate monitor evidence
-- For each relevant monitor, inspect:
+2. Define denominator
+- Build the intended route/flow list.
+- Exclude routes disabled by feature flags in the target environment.
+- Mark cohort/tenant/role-limited routes as conditional.
+
+3. Collect evidence
+- Synthetics evidence:
   - latest results
   - failed runs
   - screenshots
   - script logs
-  - step details for step monitors
-- Prefer browser-based monitors that actually navigate the frontend and wait long enough for Browser data to be captured.
-
-3. Correlate Synthetics with Browser data
-- Use Browser monitoring data to identify synthetic-generated frontend views/interactions.
-- Prefer `BrowserInteraction` when route changes or SPA transitions matter.
-- Use synthetic correlation fields documented by New Relic:
+  - step details
+- Browser evidence:
+  - `BrowserInteraction` in `SPA mode`
+  - grouped URL or page-view style evidence in `MPA/basic mode`
+- For synthetic/browser correlation, use New Relic fields such as:
   - `monitorAccountId`
   - `monitorId`
   - `monitorJobId`
-- If the browser comparison data is missing, check whether the monitor is too short-lived.
-- Per New Relic docs, a scripted browser monitor may need a post-load wait so BrowserInteraction is captured.
+- If synthetic/browser comparison data is missing for a scripted browser monitor, check whether the run ends too quickly after load.
 
-4. Build the denominator
-- Best denominator: intended route/flow inventory supplied by the repo or product owner.
-- Acceptable sources:
-  - router definitions
-  - sitemap
-  - nav menus
-  - key landing pages
-  - checkout/auth/onboarding flows
-- Reduce the denominator by routes/flows that are disabled by feature flags in the target environment.
-- Normalize route names before comparing:
-  - use grouped URLs when Browser grouping is configured well
-  - if URL grouping is poor, fix naming first
-  - consider Browser APIs such as `setPageViewName` or SPA route naming if the app already uses them
-- Record flag dependencies for each optional route or flow when known.
+4. Compute coverage
+- `Covered`: at least one qualifying synthetic observation in the window
+- `Weak`: covered, but only one monitor, browser, device profile, location, or run
+- `Uncovered`: in denominator, but no qualifying observation
+- `Out of scope by flag`: intentionally excluded because the flag is disabled
+- `Conditional`: covered only for a flag state, cohort, tenant, or role
 
-5. Compute coverage
-- Numerator:
-  - routes or flows with at least one qualifying browser-based synthetic observation in the window
-- Denominator:
-  - intended route/flow inventory after excluding flag-disabled scope
-- Coverage %:
-  - `covered / total * 100`
-- Produce at least:
-  - overall frontend coverage %
-  - per-monitor route coverage
-  - uncovered routes
-  - weakly covered routes:
-    - only one monitor
-    - only one browser
-    - only one device profile
-  - out-of-scope-by-flag routes
-
-6. Review replay/evidence for gaps
-- For uncovered or suspicious routes:
-  - review Synthetics screenshots and logs first
-  - review Browser Session Replay only when the user also wants real-user evidence
-- If Session Replay is needed:
-  - verify Browser Pro or Pro+SPA agent
-  - verify replay is enabled
-  - verify session tracing is enabled
-  - verify replay sampling and permissions
-
-## Coverage rules
-
-Use these rules consistently:
-
-- `Covered`
-  - At least one browser-based synthetic monitor observed the route/flow in the window.
-- `Weak coverage`
-  - Covered, but only:
-    - one browser, or
-    - one device profile, or
-    - one location, or
-    - one monitor, or
-    - one run in the window
-- `Uncovered`
-  - In the denominator, but no qualifying synthetic observation in the window.
-- `Observed only`
-  - Seen in Browser synthetic data, but not mapped to the agreed route inventory.
-- `Out of scope by flag`
-  - Route or flow exists, but is disabled by feature flag for the target environment or audience.
-- `Conditional coverage`
-  - Route or flow is covered only for a specific flag state, tenant, role, or cohort.
+Coverage %:
+- numerator = covered routes/flows
+- denominator = intended routes/flows minus out-of-scope-by-flag items
 
 ## NRQL starting points
 
-Adjust names and limits to the account.
-
-### Synthetic-generated browser interactions
-
-```sql
-FROM BrowserInteraction
-SELECT uniqueCount(browserInteractionName), uniques(browserInteractionName, 2000)
-WHERE appName = 'YOUR_BROWSER_APP'
-  AND monitorId IS NOT NULL
-SINCE 7 days ago
-```
-
-### Synthetic-generated interactions by monitor
+### SPA mode
 
 ```sql
 FROM BrowserInteraction
@@ -176,62 +92,29 @@ SELECT uniques(browserInteractionName, 2000)
 WHERE appName = 'YOUR_BROWSER_APP'
   AND monitorId IS NOT NULL
 SINCE 7 days ago
-FACET monitorId
 ```
 
-### Synthetic-generated grouped URLs when route names are poor
+### Correlation by monitor
 
 ```sql
 FROM BrowserInteraction
-SELECT uniques(targetGroupedUrl, 2000)
+SELECT uniques(browserInteractionName, 2000), latest(monitorJobId)
 WHERE appName = 'YOUR_BROWSER_APP'
   AND monitorId IS NOT NULL
 SINCE 7 days ago
+FACET monitorId
 ```
 
-### Synthetic monitor run correlation
-
-```sql
-FROM BrowserInteraction
-SELECT latest(monitorJobId)
-WHERE appName = 'YOUR_BROWSER_APP'
-  AND monitorId = 'YOUR_MONITOR_ID'
-SINCE 7 days ago
-```
-
-### Real-user replay investigation companion query
-
-```sql
-FROM BrowserInteraction
-SELECT count(*)
-WHERE appName = 'YOUR_BROWSER_APP'
-  AND monitorId IS NULL
-SINCE 7 days ago
-FACET browserInteractionName
-```
-
-## Monitor design guidance
-
-When the user wants better coverage, recommend:
-- scripted browser or step monitors over simple browser when route coverage matters
-- multiple browsers where customer traffic justifies it
-- device emulation for mobile/tablet-sensitive frontend paths
-- explicit waits after page load when BrowserInteraction correlation is missing
-- route naming cleanup before chasing exact percentages
-
-Do not over-claim precision:
-- if route grouping is poor, say coverage % is low-confidence
-- if the denominator is incomplete, say it is partial coverage only
-- if monitor data is recent or sparse, say so explicitly
-- if feature-flag state is unknown, lower confidence and call out that denominator assumptions may be wrong
+If route names are poor, use grouped URL evidence and say coverage confidence is lower.
 
 ## Output
 
-Use this structure:
+Use this exact structure:
 
 1. `Coverage summary`
 - overall coverage %
-- denominator definition
+- coverage mode: `SPA` or `MPA/basic`
+- denominator basis: `authoritative` or `estimated`
 - confidence: `high`, `medium`, or `low`
 
 2. `Monitor inventory`
@@ -243,35 +126,26 @@ Use this structure:
 3. `Covered routes`
 - route or flow
 - monitor(s)
-- evidence type: interaction, screenshot, log, replay
-- flag state or audience when relevant
+- evidence used
+- conditional audience or flag state when relevant
 
 4. `Uncovered or weak routes`
 - route or flow
 - gap type
-- why it is weak or uncovered
+- why
 - recommended monitor addition
 
 5. `Out of scope by flag`
 - route or flow
 - controlling flag when known
 - target environment assumption
-- note that it is intentionally excluded from coverage %
 
-6. `Replay/evidence notes`
-- whether Synthetics evidence was enough
-- whether Browser Session Replay was also required
+6. `Next actions`
+- first 3 improvements
 
-7. `Next actions`
-- first 3 monitor or instrumentation improvements
+## Notes
 
-## Source notes
-
-Base this skill on current New Relic docs, especially:
-- monitor types and browser-based monitor capabilities
-- result details, screenshots, and script logs
-- Browser Session Replay setup and troubleshooting
-- Browser/Synthetics comparison data and `monitorId` correlation
-- device emulation and multi-browser support
-
-If the docs or account behavior disagree, prefer the actual account behavior and state the discrepancy clearly.
+- If feature-flag state is unknown, lower confidence.
+- If route grouping is poor, lower confidence.
+- If denominator is estimated, say the % is directional, not exact.
+- Prefer account behavior over documentation if they disagree, but state the discrepancy clearly.

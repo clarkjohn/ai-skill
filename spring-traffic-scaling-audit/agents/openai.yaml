@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spring Traffic Scaling Audit"
+  short_description: "Audit Spring services for traffic scaling"
+  default_prompt: "Use $spring-traffic-scaling-audit to audit this Spring microservice's controller traffic scaling, burst behavior, downstream limits, and CPU/heap/memory capacity."

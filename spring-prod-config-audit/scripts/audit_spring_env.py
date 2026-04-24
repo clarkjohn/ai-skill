@@ -359,36 +359,113 @@ def prod_smells(config: dict) -> list[dict]:
     if truthy(props.get("spring.h2.console.enabled")):
         add("high", "H2 console enabled in prod", "spring.h2.console.enabled", props.get("spring.h2.console.enabled"))
 
+    for key in ("spring.datasource.url", "spring.r2dbc.url"):
+        value = str(props.get(key, ""))
+        if re.search(r"(?:jdbc:|r2dbc:)(?:h2|hsqldb|derby):", value, re.I):
+            add("high", "embedded database URL in prod", key, value)
+
     ddl_auto = str(props.get("spring.jpa.hibernate.ddl-auto", ""))
     if ddl_auto in {"create", "create-drop"}:
         add("high", "dangerous ddl-auto in prod", "spring.jpa.hibernate.ddl-auto", ddl_auto)
     elif ddl_auto == "update":
         add("medium", "ddl-auto=update in prod", "spring.jpa.hibernate.ddl-auto", ddl_auto)
 
-    exposure = str(props.get("management.endpoints.web.exposure.include", ""))
-    if "*" in [item.strip() for item in exposure.split(",")]:
-        add("high", "all actuator endpoints exposed", "management.endpoints.web.exposure.include", exposure)
+    if truthy(props.get("spring.jpa.generate-ddl")):
+        add("medium", "JPA schema generation enabled in prod", "spring.jpa.generate-ddl", props.get("spring.jpa.generate-ddl"))
 
-    for endpoint in ("env", "configprops", "beans", "mappings", "heapdump", "threaddump", "loggers", "shutdown"):
+    if truthy(props.get("spring.jpa.show-sql")):
+        add("medium", "SQL logging enabled in prod", "spring.jpa.show-sql", props.get("spring.jpa.show-sql"))
+
+    for key, value in props.items():
+        if key.startswith("logging.level.org.hibernate") and str(value).upper() in {"DEBUG", "TRACE"}:
+            add("medium", "Hibernate SQL/bind logging enabled in prod", key, value)
+            break
+
+    for key in ("spring.sql.init.mode", "spring.datasource.initialization-mode"):
+        if str(props.get(key, "")).lower() == "always":
+            add("high", "SQL initialization always active in prod", key, props.get(key))
+
+    if truthy(props.get("spring.liquibase.drop-first")):
+        add("high", "Liquibase configured to drop schema first", "spring.liquibase.drop-first", props.get("spring.liquibase.drop-first"))
+
+    if falsey(props.get("spring.flyway.clean-disabled")):
+        add("high", "Flyway clean is allowed in prod", "spring.flyway.clean-disabled", props.get("spring.flyway.clean-disabled"))
+
+    for key in ("spring.flyway.baseline-on-migrate", "spring.liquibase.clear-checksums"):
+        if truthy(props.get(key)):
+            add("medium", "migration escape hatch enabled in prod", key, props.get(key))
+
+    if falsey(props.get("spring.flyway.enabled")):
+        add("medium", "Flyway disabled in prod; verify separate migration path", "spring.flyway.enabled", props.get("spring.flyway.enabled"))
+    if falsey(props.get("spring.liquibase.enabled")):
+        add("medium", "Liquibase disabled in prod; verify separate migration path", "spring.liquibase.enabled", props.get("spring.liquibase.enabled"))
+
+    exposure = str(props.get("management.endpoints.web.exposure.include", ""))
+    exposed_endpoints = csv_values(exposure)
+    sensitive_endpoints = {"env", "configprops", "beans", "mappings", "heapdump", "threaddump", "loggers", "shutdown"}
+    if "*" in exposed_endpoints:
+        add("high", "all actuator endpoints exposed", "management.endpoints.web.exposure.include", exposure)
+    else:
+        exposed_sensitive = sorted(sensitive_endpoints.intersection(exposed_endpoints))
+        if exposed_sensitive:
+            add(
+                "high",
+                f"sensitive actuator endpoint exposed over web: {', '.join(exposed_sensitive)}",
+                "management.endpoints.web.exposure.include",
+                exposure,
+            )
+
+    for endpoint in sorted(sensitive_endpoints):
         key = f"management.endpoint.{endpoint}.enabled"
         if truthy(props.get(key)):
             add("medium", "sensitive actuator endpoint enabled", key, props.get(key))
 
-    if props.get("management.endpoint.health.show-details") == "always":
-        add("medium", "health details always exposed", "management.endpoint.health.show-details", "always")
+    for key in ("management.endpoint.env.show-values", "management.endpoint.configprops.show-values", "management.endpoint.quartz.show-values"):
+        if str(props.get(key, "")).lower() == "always":
+            add("high", "actuator endpoint configured to show unsanitized values", key, props.get(key))
+
+    if str(props.get("management.endpoint.health.show-details", "")).lower() == "always":
+        add("medium", "health details always exposed", "management.endpoint.health.show-details", props.get("management.endpoint.health.show-details"))
 
     if str(props.get("logging.level.root", "")).upper() in {"DEBUG", "TRACE"}:
         add("medium", "verbose root logging in prod", "logging.level.root", props.get("logging.level.root"))
 
-    for key in ("server.error.include-stacktrace", "server.error.include-message"):
-        if props.get(key) == "always":
-            add("medium", "dev-style error detail enabled in prod", key, "always")
+    for key in ("server.error.include-stacktrace", "server.error.include-message", "server.error.include-binding-errors"):
+        if str(props.get(key, "")).lower() == "always":
+            add("medium", "dev-style error detail enabled in prod", key, props.get(key))
+
+    if truthy(props.get("server.error.include-exception")):
+        add("medium", "exception class included in error responses", "server.error.include-exception", props.get("server.error.include-exception"))
 
     cors_keys = [key for key in props if re.search(r"allowed-origins|allowedOriginPatterns|cors", key, re.I)]
     for key in cors_keys:
         if "*" in str(props[key]):
             add("medium", "broad CORS origin policy in prod", key, props[key])
             break
+
+    config_import = str(props.get("spring.config.import", ""))
+    if "optional:" in config_import and re.search(r"configserver|vault|configtree|consul|kubernetes|aws|azure|gcp|file:", config_import, re.I):
+        add("medium", "required-looking prod config import is optional", "spring.config.import", config_import)
+
+    if truthy(props.get("spring.jpa.open-in-view")):
+        add("medium", "Open EntityManager in View explicitly enabled", "spring.jpa.open-in-view", props.get("spring.jpa.open-in-view"))
+
+    for key in ("server.servlet.session.cookie.secure", "server.reactive.session.cookie.secure"):
+        if falsey(props.get(key)):
+            add("medium", "session cookie explicitly not secure; verify TLS/proxy context", key, props.get(key))
+    for key in ("server.servlet.session.cookie.http-only", "server.reactive.session.cookie.http-only"):
+        if falsey(props.get(key)):
+            add("medium", "session cookie explicitly not HTTP-only", key, props.get(key))
+
+    if str(props.get("server.forward-headers-strategy", "")).lower() == "none":
+        add("low", "forwarded headers disabled; verify proxy/TLS termination context", "server.forward-headers-strategy", props.get("server.forward-headers-strategy"))
+
+    if str(props.get("server.shutdown", "")).lower() == "immediate":
+        add("low", "immediate shutdown configured; verify orchestrated traffic draining", "server.shutdown", props.get("server.shutdown"))
+
+    for key in ("spring.main.lazy-initialization", "spring.main.allow-bean-definition-overriding"):
+        if truthy(props.get(key)):
+            add("low", "risky Spring main setting enabled in prod", key, props.get(key))
 
     return findings
 
@@ -504,6 +581,14 @@ def redact(key: str, value: str | None) -> str | None:
 
 def truthy(value: str | None) -> bool:
     return str(value).strip().lower() == "true"
+
+
+def falsey(value: str | None) -> bool:
+    return str(value).strip().lower() == "false"
+
+
+def csv_values(value: str | None) -> set[str]:
+    return {item.strip().lower() for item in str(value or "").split(",") if item.strip()}
 
 
 def severity_for(key: str) -> str:

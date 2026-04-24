@@ -6,7 +6,15 @@
 - Spring stack:
 - Environment:
 - Endpoints:
-- Test status: measured / planned / code-only readiness
+- Audit mode: static estimate / measured
+- Test status: service not running / measured / planned
+- Confidence:
+
+## Web Stack Failure Mode
+
+- Stack: MVC / WebFlux / mixed / unknown
+- Primary static risk:
+- Evidence:
 
 ## Traffic Model
 
@@ -69,15 +77,21 @@ Derived dependency checks:
 - Retry amplification risk:
 - Pool starvation risk:
 
-## Scaling Results
+## Circuit Breakers
 
-| Target TPS | Achieved TPS | p50 | p95 | p99 | Errors | CPU | RSS | Heap after GC | Alloc rate | GC pause | Pool wait | Downstream p99 | Notes |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Dependency/flow | Library/config | Timeout/slow-call threshold | Failure threshold | Bulkhead/rate limiter | Fallback | Evidence | Gap |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+|  | Resilience4j/Spring Cloud CircuitBreaker/none |  |  |  |  |  |  |
 
-## Burst Results
+## Scaling Results or Estimates
 
-| Burst | Accepted | Rejected/throttled | p99 | Recovery time | Bottleneck | Graceful? |
-| --- | ---: | ---: | ---: | ---: | --- | --- |
+| Target TPS | Achieved TPS or estimate | p50 | p95 | p99 | Errors | CPU | RSS | Heap after GC | Alloc rate | GC pause | Pool wait | Downstream p99 | Evidence basis | Notes |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+
+## Burst Results or Estimates
+
+| Burst | Accepted estimate/result | Rejected/throttled estimate/result | p99 | Recovery time | Bottleneck | Graceful? | Evidence basis |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
 
 ## Bottlenecks
 
@@ -89,9 +103,9 @@ Likely:
 
 ## Capacity Estimate
 
-- Max sustainable TPS:
-- Safe operating TPS:
-- Burst tolerance:
+- Estimated max sustainable TPS:
+- Estimated safe operating TPS:
+- Estimated burst tolerance:
 - Confidence:
 
 ## Gaps
